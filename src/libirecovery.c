@@ -98,6 +98,18 @@
         static void f(void)
 #endif
 
+#ifndef WIN32
+struct irecv_async_transfer {
+ 	uint32_t len;
+ #ifdef HAVE_IOKIT
+ 	kern_return_t ret;
+ #else
+ 	enum libusb_transfer_status ret;
+ #endif
+};
+
+#endif
+
 struct irecv_client_private {
 	int debug;
 	int usb_config;
@@ -113,6 +125,7 @@ struct irecv_client_private {
 #else
 	IOUSBDeviceInterface320 **handle;
 	IOUSBInterfaceInterface300 **usbInterface;
+	CFRunLoopSourceRef async_event_source;
 #endif
 #else
 	HANDLE handle;
@@ -1402,6 +1415,7 @@ static int iokit_usb_control_transfer(irecv_client_t client, uint8_t bm_request_
 	result = (*client->handle)->DeviceRequestTO(client->handle, &req);
 	switch (result) {
 		case kIOReturnSuccess:         return req.wLenDone;
+		case kIOUSBPipeStalled:        return IRECV_E_PIPE;
 		case kIOReturnTimeout:         return IRECV_E_TIMEOUT;
 		case kIOUSBTransactionTimeout: return IRECV_E_TIMEOUT;
 		case kIOReturnNotResponding:   return IRECV_E_NO_DEVICE;
@@ -1468,6 +1482,158 @@ int irecv_usb_control_transfer(irecv_client_t client, uint8_t bm_request_type, u
 	free(packet);
 
 	return count;
+#endif
+#endif
+}
+
+#ifndef WIN32
+#ifdef HAVE_IOKIT
+
+static void iokit_async_cb(void *refcon, kern_return_t ret, void *arg_0)
+{
+	struct irecv_async_transfer* transfer = refcon;
+
+	if(transfer != NULL) {
+		transfer->ret = ret;
+		memcpy(&transfer->len, &arg_0, sizeof(transfer->len));
+		CFRunLoopStop(CFRunLoopGetCurrent());
+	}
+}
+
+static int iokit_async_usb_control_transfer(irecv_client_t client, uint8_t bm_request_type, uint8_t b_request, uint16_t w_value, uint16_t w_index, unsigned char *data, uint16_t w_length, struct irecv_async_transfer* transfer)
+{
+	IOReturn result;
+	IOUSBDevRequest req;
+
+	bzero(&req, sizeof(req));
+	req.bmRequestType     = bm_request_type;
+	req.bRequest          = b_request;
+	req.wValue            = OSSwapLittleToHostInt16(w_value);
+	req.wIndex            = OSSwapLittleToHostInt16(w_index);
+	req.wLength           = OSSwapLittleToHostInt16(w_length);
+	req.pData             = data;
+	result = (*client->handle)->DeviceRequestAsync(client->handle, &req, iokit_async_cb, transfer);
+	switch (result) {
+		case kIOReturnSuccess:         return IRECV_E_SUCCESS;
+		case kIOUSBPipeStalled:        return IRECV_E_PIPE;
+		case kIOReturnTimeout:         return IRECV_E_TIMEOUT;
+		case kIOUSBTransactionTimeout: return IRECV_E_TIMEOUT;
+		case kIOReturnNotResponding:   return IRECV_E_NO_DEVICE;
+		case kIOReturnNoDevice:	       return IRECV_E_NO_DEVICE;
+		default:
+			return IRECV_E_UNKNOWN_ERROR;
+	}
+}
+
+#else
+
+static void async_cb(struct libusb_transfer* usb_transfer) {
+	struct irecv_async_transfer* transfer = usb_transfer->user_data;
+	transfer->ret = usb_transfer->status;
+	transfer->len += usb_transfer->actual_length;
+}
+
+#endif
+#endif
+
+IRECV_API int irecv_async_usb_control_transfer(irecv_client_t client, uint8_t bm_request_type, uint8_t b_request, uint16_t w_value, uint16_t w_index, unsigned char *data, uint16_t w_length) {
+#ifdef USE_DUMMY
+	return IRECV_E_UNSUPPORTED;
+#else
+#ifndef _WIN32
+#ifdef HAVE_IOKIT
+	return iokit_async_usb_control_transfer(client, bm_request_type, b_request, w_value, w_index, data, w_length, NULL);
+#else
+	irecv_error_t error;
+
+	unsigned char* buffer = malloc(w_length + 8);
+	if(!buffer) {
+		return IRECV_E_OUT_OF_MEMORY;
+	}
+	struct libusb_transfer* usb_transfer = libusb_alloc_transfer(0);
+	if(!usb_transfer) {
+		free(buffer);
+		return IRECV_E_OUT_OF_MEMORY;
+	}
+	memcpy((buffer + 8), data, w_length);
+	libusb_fill_control_setup(buffer, bm_request_type, b_request, w_value, w_index, w_length);
+	libusb_fill_control_transfer(usb_transfer, client->handle, buffer, NULL, NULL, 0);
+	usb_transfer->flags |= LIBUSB_TRANSFER_FREE_BUFFER;
+	error = libusb_submit_transfer(usb_transfer);
+	if(error != 0) {
+		free(buffer);
+		return error;
+	}
+	free(buffer);
+	return IRECV_E_SUCCESS;
+#endif
+#else
+	return IRECV_E_UNSUPPORTED;
+#endif
+#endif
+
+}
+
+IRECV_API int irecv_async_usb_control_transfer_with_cancel(irecv_client_t client, uint8_t bm_request_type, uint8_t b_request, uint16_t w_value, uint16_t w_index, unsigned char *data, uint16_t w_length, unsigned int u_time) {
+#ifdef USE_DUMMY
+	return IRECV_E_UNSUPPORTED;
+#else
+#ifndef _WIN32
+	irecv_error_t error;
+	struct irecv_async_transfer transfer;
+	bzero(&transfer, sizeof(struct irecv_async_transfer));
+
+#ifdef HAVE_IOKIT
+
+	error = iokit_async_usb_control_transfer(client, bm_request_type, b_request, w_value, w_index, data, w_length, &transfer);
+	if(error != IRECV_E_SUCCESS) {
+		return error;
+	}
+	usleep(u_time);
+	error = (*client->handle)->USBDeviceAbortPipeZero(client->handle);
+	if(error != kIOReturnSuccess) {
+		return IRECV_E_UNKNOWN_ERROR;
+	}
+	while(transfer.ret != kIOReturnAborted){
+		CFRunLoopRun();
+	}
+	return transfer.len;
+#else
+	unsigned char* buffer = malloc(w_length + 8);
+	if(!buffer) {
+		return IRECV_E_OUT_OF_MEMORY;
+	}
+	struct libusb_transfer* usb_transfer = libusb_alloc_transfer(0);
+	if(!usb_transfer) {
+		free(buffer);
+		return IRECV_E_OUT_OF_MEMORY;
+	}
+	memcpy((buffer + 8), data, w_length);
+	libusb_fill_control_setup(buffer, bm_request_type, b_request, w_value, w_index, w_length);
+	libusb_fill_control_transfer(usb_transfer, client->handle, buffer, async_cb, &transfer, 0);
+	usb_transfer->flags |= LIBUSB_TRANSFER_FREE_BUFFER;
+	error = libusb_submit_transfer(usb_transfer);
+	if(error != 0) {
+		free(buffer);
+		return error;
+	}
+
+	usleep(u_time);
+
+	error = libusb_cancel_transfer(usb_transfer);
+	if(error != 0) {
+		free(buffer);
+		return error;
+	}
+	free(buffer);
+
+	while(transfer.ret != LIBUSB_TRANSFER_CANCELLED){
+		libusb_handle_events_completed(libirecovery_context, NULL);
+	}
+	return transfer.len;
+#endif
+#else
+	return IRECV_E_UNSUPPORTED;
 #endif
 #endif
 }
@@ -1977,6 +2143,15 @@ irecv_error_t irecv_open_with_ecid(irecv_client_t* pclient, uint64_t ecid)
 		irecv_close(client);
 		return error;
 	}
+
+#ifdef HAVE_IOKIT
+	error = (*client->handle)->CreateDeviceAsyncEventSource(client->handle, &client->async_event_source);
+	if (error != IRECV_E_SUCCESS) {
+		free(client);
+		return error;
+	}
+	CFRunLoopAddSource(CFRunLoopGetCurrent(), client->async_event_source, kCFRunLoopDefaultMode);
+#endif
 
 	if (client->mode == IRECV_K_DFU_MODE || client->mode == IRECV_K_PORT_DFU_MODE || client->mode == IRECV_K_WTF_MODE || client->mode == KIS_PRODUCT_ID) {
 		error = irecv_usb_set_interface(client, 0, 0);
@@ -3195,6 +3370,10 @@ static irecv_error_t irecv_cleanup(irecv_client_t client)
 			(*client->handle)->USBDeviceClose(client->handle);
 			(*client->handle)->Release(client->handle);
 			client->handle = NULL;
+		}
+		if(client->async_event_source) {
+			CFRunLoopRemoveSource(CFRunLoopGetCurrent(), client->async_event_source, kCFRunLoopDefaultMode);
+			CFRelease(client->async_event_source);
 		}
 #else
 		if (client->handle != NULL) {
